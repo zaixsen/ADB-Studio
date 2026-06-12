@@ -41,6 +41,34 @@ def to_text(value):
     return text_type(value)
 
 
+def normalize_network_address(value):
+    address = to_text(value).strip()
+    if not address:
+        raise ValueError("IP 地址不能为空。")
+
+    parts = address.split(":")
+    if len(parts) > 2:
+        raise ValueError("IP 地址格式无效。")
+
+    ip_address = parts[0]
+    port_text = parts[1] if len(parts) == 2 else "5555"
+    octets = ip_address.split(".")
+    if len(octets) != 4 or any(
+            not octet.isdigit() or not 0 <= int(octet) <= 255
+            for octet in octets):
+        raise ValueError("IP 地址格式无效。")
+
+    if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        raise ValueError("端口必须是 1 到 65535 之间的数字。")
+
+    return "{}:{}".format(ip_address, port_text)
+
+
+def serial_from_device_label(selection):
+    match = re.search(r"\(([^)]+)\)$", selection)
+    return match.group(1) if match else selection
+
+
 class AdbInstallerApp:
     def __init__(self, root):
         self.root = root
@@ -51,9 +79,11 @@ class AdbInstallerApp:
         self.selected_device = tk.StringVar()
         self.selected_apk = tk.StringVar()
         self.selected_uninstall_package = tk.StringVar()
+        self.network_address = tk.StringVar()
         self.push_local_path = tk.StringVar()
         self.push_remote_path = tk.StringVar(value="/sdcard/Download/")
         self.pull_remote_path = tk.StringVar(value="/sdcard/Download/")
+        self.preferred_device_serial = None
 
         self.feature_panels = {}
         self.feature_buttons = {}
@@ -100,6 +130,10 @@ class AdbInstallerApp:
         self.restart_btn = ttk.Button(toolbar, text="重启 ADB", command=self.restart_adb)
         self.restart_btn.pack(side=tk.LEFT)
 
+        network_toolbar = ttk.Frame(self.root, padding=(10, 0, 10, 8))
+        network_toolbar.pack(fill=tk.X)
+        self.create_connection_controls(network_toolbar)
+
         nav_frame = ttk.Frame(self.root, padding=(10, 0, 10, 8))
         nav_frame.pack(fill=tk.X)
         nav_items = [
@@ -141,6 +175,18 @@ class AdbInstallerApp:
             wrap=tk.WORD
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def create_connection_controls(self, parent):
+        ttk.Label(parent, text="IP 地址:").pack(side=tk.LEFT)
+        ttk.Entry(parent, textvariable=self.network_address).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8)
+        )
+        self.connect_btn = ttk.Button(
+            parent,
+            text="连接 IP",
+            command=self.start_connect_thread
+        )
+        self.connect_btn.pack(side=tk.LEFT)
 
     def create_install_panel(self):
         panel = ttk.LabelFrame(self.feature_host, text="安装 APK", padding=12)
@@ -294,8 +340,7 @@ class AdbInstallerApp:
         selection = self.selected_device.get()
         if not selection:
             return None
-        match = re.search(r"\(([^)]+)\)$", selection)
-        return match.group(1) if match else selection
+        return serial_from_device_label(selection)
 
     def get_apks(self):
         paths = glob.glob(os.path.join(APK_DIR, "*.apk"))
@@ -321,7 +366,18 @@ class AdbInstallerApp:
         devices = self.get_devices()
         self.device_combo["values"] = devices
         if devices:
-            if previous_device in devices:
+            preferred_device = None
+            preferred_serial = getattr(self, "preferred_device_serial", None)
+            if preferred_serial:
+                for device in devices:
+                    if serial_from_device_label(device) == preferred_serial:
+                        preferred_device = device
+                        break
+
+            if preferred_device:
+                self.selected_device.set(preferred_device)
+                self.preferred_device_serial = None
+            elif previous_device in devices:
                 self.selected_device.set(previous_device)
             else:
                 self.device_combo.current(0)
@@ -370,6 +426,56 @@ class AdbInstallerApp:
     def on_device_selected(self, event=None):
         self.log("已切换设备: " + self.selected_device.get())
         self.refresh_uninstall_packages()
+
+    def start_connect_thread(self):
+        try:
+            address = normalize_network_address(self.network_address.get())
+        except ValueError as error:
+            messagebox.showwarning("提示", to_text(error))
+            return
+
+        def run():
+            self.log("-" * 40)
+            self.log("执行命令: adb connect " + address)
+            try:
+                process = subprocess.Popen(
+                    ["adb", "connect", address],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    startupinfo=self.create_startupinfo()
+                )
+                stdout, stderr = process.communicate()
+                output = to_text(stdout).strip()
+                error_output = to_text(stderr).strip()
+                if output:
+                    self.log(output)
+                if error_output:
+                    self.log("输出: " + error_output)
+
+                failed_output = (output + " " + error_output).lower()
+                failed = any(
+                    marker in failed_output
+                    for marker in ("failed", "cannot", "unable")
+                )
+                if process.returncode == 0 and not failed:
+                    self.preferred_device_serial = address
+                    self.log("设备连接成功。")
+                    self.root.after(0, self.refresh_data)
+                else:
+                    self.log("设备连接失败，请检查 IP 地址和设备网络调试设置。")
+            except OSError:
+                self.log("错误: 未找到 adb 命令，请检查 PATH 配置。")
+            except Exception as error:
+                self.log("连接设备失败: " + to_text(error))
+            finally:
+                self.root.after(
+                    0, lambda: self.connect_btn.config(state="normal")
+                )
+
+        self.connect_btn.config(state="disabled")
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
 
     def restart_adb(self):
         def run():
