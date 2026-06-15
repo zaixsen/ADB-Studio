@@ -2,5 +2,3 @@
 # 每行填写一个 Android 包名，例如：
 # com.example.app
 
-com.chillingo
-com.coolfishgames.
