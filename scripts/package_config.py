@@ -53,3 +53,9 @@ def merge_package_names(*package_lists):
                 seen.add(package_name)
                 merged.append(package_name)
     return merged
+
+
+def save_package_names(path, names):
+    with io.open(path, "w", encoding="utf-8") as f:
+        for name in names:
+            f.write(name + "\n")
