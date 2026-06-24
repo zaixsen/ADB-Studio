@@ -5,11 +5,23 @@ import datetime
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import tempfile
+import zipfile
 
-from package_config import load_package_names, merge_package_names, parse_adb_package_list, save_package_names
+from package_config import (
+    extract_apk_label,
+    load_package_names,
+    merge_package_names,
+    parse_adb_apk_paths,
+    parse_adb_package_list,
+    parse_adb_package_labels,
+    parse_adb_packages,
+    save_package_names,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -18,18 +30,35 @@ PULL_DIR = os.path.join(PROJECT_DIR, "ReadByPhone")
 UNINSTALL_PACKAGES_FILE = os.path.join(PROJECT_DIR, "uninstall_packages.txt")
 UNINSTALL_PREFIXES_FILE = os.path.join(PROJECT_DIR, "uninstall_package_prefixes.txt")
 
-# Colors
-COLOR_NAV_ACTIVE_BG = "#2563EB"
-COLOR_NAV_ACTIVE_FG = "#FFFFFF"
-COLOR_NAV_IDLE_BG = "#E5E7EB"
-COLOR_NAV_IDLE_FG = "#374151"
-COLOR_NAV_HOVER_BG = "#D1D5DB"
-COLOR_LOG_BG = "#1E1E1E"
-COLOR_LOG_FG = "#D4D4D4"
-COLOR_LOG_TIME = "#6A9955"
-COLOR_LOG_CMD = "#4FC1FF"
-COLOR_LOG_ERR = "#F44747"
-COLOR_LOG_OK = "#4EC9B0"
+# ── Design System ─────────────────────────────────────────────────────────────
+C_WIN        = "#0D1117"
+C_SURFACE    = "#161B22"
+C_SURFACE2   = "#21262D"
+C_HEADER_BG  = "#010409"
+
+C_ACCENT     = "#58A6FF"
+C_ACCENT_LT  = "#79C0FF"
+
+C_TEXT       = "#E6EDF3"
+C_TEXT_DIM   = "#8B949E"
+C_TEXT_MUTED = "#3D444D"
+
+C_BORDER     = "#30363D"
+
+C_OK         = "#3FB950"
+C_ERR        = "#F85149"
+
+C_LOG_BG     = "#010409"
+C_LOG_FG     = "#C9D1D9"
+C_LOG_TIME   = "#6E7681"
+C_LOG_CMD    = "#79C0FF"
+C_LOG_OK     = "#56D364"
+C_LOG_ERR    = "#F85149"
+
+F_UI         = ("Segoe UI", 9)
+F_UI_BOLD    = ("Segoe UI", 9, "bold")
+F_TITLE      = ("Segoe UI", 15, "bold")
+F_MONO       = ("Consolas", 9)
 
 try:
     text_type = unicode
@@ -59,11 +88,9 @@ def normalize_network_address(value):
     address = to_text(value).strip()
     if not address:
         raise ValueError("IP 地址不能为空。")
-
     parts = address.split(":")
     if len(parts) > 2:
         raise ValueError("IP 地址格式无效。")
-
     ip_address = parts[0]
     port_text = parts[1] if len(parts) == 2 else "5555"
     octets = ip_address.split(".")
@@ -71,10 +98,8 @@ def normalize_network_address(value):
             not octet.isdigit() or not 0 <= int(octet) <= 255
             for octet in octets):
         raise ValueError("IP 地址格式无效。")
-
     if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
         raise ValueError("端口必须是 1 到 65535 之间的数字。")
-
     return "{}:{}".format(ip_address, port_text)
 
 
@@ -83,66 +108,134 @@ def serial_from_device_label(selection):
     return match.group(1) if match else selection
 
 
-class NavButton(tk.Frame):
-    """Custom nav tab button with reliable cross-platform active state."""
+def _is_install_package(path):
+    lower = path.lower()
+    return lower.endswith(".apk") or lower.endswith(".xapk")
+
+
+def _xapk_sort_key(path):
+    name = os.path.basename(path).lower()
+    return (0 if name == "base.apk" else 1, name)
+
+
+def build_xapk_install_args(xapk_path, extract_dir):
+    try:
+        archive = zipfile.ZipFile(xapk_path, "r")
+    except Exception as error:
+        raise ValueError("Invalid or unreadable XAPK file: " + to_text(error))
+
+    extracted = []
+    try:
+        for info in archive.infolist():
+            name = info.filename.replace("\\", "/")
+            if name.endswith("/") or not name.lower().endswith(".apk"):
+                continue
+            dest_name = os.path.basename(name)
+            if not dest_name:
+                continue
+
+            dest_path = os.path.join(extract_dir, dest_name)
+            base, ext = os.path.splitext(dest_name)
+            index = 1
+            while os.path.exists(dest_path):
+                dest_path = os.path.join(extract_dir, "{}_{}{}".format(base, index, ext))
+                index += 1
+
+            source = archive.open(info, "r")
+            try:
+                target = open(dest_path, "wb")
+                try:
+                    shutil.copyfileobj(source, target)
+                finally:
+                    target.close()
+            finally:
+                source.close()
+            extracted.append(dest_path)
+    except Exception as error:
+        raise ValueError("Failed to extract XAPK: " + to_text(error))
+    finally:
+        archive.close()
+
+    if not extracted:
+        raise ValueError("No APK split files found inside XAPK.")
+
+    return ["install-multiple", "-r"] + sorted(extracted, key=_xapk_sort_key)
+
+
+class TabButton(tk.Frame):
+    """VS Code-style navigation tab with accent underline indicator."""
+
+    IND_H = 2
 
     def __init__(self, parent, text, command, **kwargs):
-        tk.Frame.__init__(self, parent, cursor="hand2", **kwargs)
+        tk.Frame.__init__(self, parent, bg=C_WIN, cursor="hand2", **kwargs)
         self._command = command
         self._active = False
+        self._hovering = False
+
         self._label = tk.Label(
-            self, text=text, padx=14, pady=8,
-            font=("TkDefaultFont", 9),
-            bg=COLOR_NAV_IDLE_BG, fg=COLOR_NAV_IDLE_FG,
-            cursor="hand2"
+            self, text=text,
+            font=F_UI, bg=C_WIN, fg=C_TEXT_DIM,
+            padx=14, pady=9, cursor="hand2"
         )
-        self._label.pack(fill=tk.BOTH, expand=True)
-        self._label.bind("<Button-1>", self._on_click)
-        self._label.bind("<Enter>", self._on_enter)
-        self._label.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_click)
+        self._label.pack(fill=tk.X)
 
-    def _on_click(self, event=None):
-        self._command()
+        self._bar = tk.Frame(self, bg=C_WIN, height=self.IND_H)
+        self._bar.pack(fill=tk.X)
 
-    def _on_enter(self, event=None):
-        if not self._active:
-            self._label.config(bg=COLOR_NAV_HOVER_BG)
+        for w in (self, self._label, self._bar):
+            w.bind("<Button-1>", lambda e: self._command())
+            w.bind("<Enter>", self._on_enter)
+            w.bind("<Leave>", self._on_leave)
 
-    def _on_leave(self, event=None):
-        if not self._active:
-            self._label.config(bg=COLOR_NAV_IDLE_BG)
+    def _on_enter(self, e=None):
+        self._hovering = True
+        self._refresh()
+
+    def _on_leave(self, e=None):
+        self._hovering = False
+        self._refresh()
+
+    def _refresh(self):
+        if self._active:
+            self._label.config(fg=C_TEXT, font=F_UI_BOLD, bg=C_WIN)
+            self._bar.config(bg=C_ACCENT)
+            self.config(bg=C_WIN)
+        elif self._hovering:
+            self._label.config(fg=C_TEXT, font=F_UI, bg=C_SURFACE2)
+            self._bar.config(bg=C_WIN)
+            self.config(bg=C_SURFACE2)
+        else:
+            self._label.config(fg=C_TEXT_DIM, font=F_UI, bg=C_WIN)
+            self._bar.config(bg=C_WIN)
+            self.config(bg=C_WIN)
 
     def set_active(self, active):
         self._active = active
-        if active:
-            self._label.config(
-                bg=COLOR_NAV_ACTIVE_BG, fg=COLOR_NAV_ACTIVE_FG,
-                font=("TkDefaultFont", 9, "bold")
-            )
-        else:
-            self._label.config(
-                bg=COLOR_NAV_IDLE_BG, fg=COLOR_NAV_IDLE_FG,
-                font=("TkDefaultFont", 9)
-            )
+        self._refresh()
 
 
 class AdbInstallerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ADB 设备工具")
-        self.root.geometry("780x680")
-        self.root.minsize(680, 560)
+        self.root.title("ADB Device Tools")
+        self.root.geometry("860x720")
+        self.root.minsize(720, 580)
+        self.root.configure(bg=C_WIN)
 
         self.selected_device = tk.StringVar()
         self.selected_apk = tk.StringVar()
         self.selected_uninstall_package = tk.StringVar()
+        self.selected_export_package = tk.StringVar()
+        self.export_target_dir = tk.StringVar()
         self.network_address = tk.StringVar()
         self.push_local_path = tk.StringVar()
         self.push_remote_path = tk.StringVar(value="/sdcard/Download/")
         self.pull_remote_path = tk.StringVar(value="/sdcard/Download/")
         self.preferred_device_serial = None
 
+        self._package_labels = {}
+        self._package_display_map = {}
         self.feature_panels = {}
         self.feature_buttons = {}
 
@@ -158,248 +251,365 @@ class AdbInstallerApp:
         except tk.TclError:
             pass
 
-        style.configure("TButton", padding=(10, 6))
-        style.configure("TLabel", padding=2)
-        style.configure("Toolbar.TFrame", padding=(10, 6, 10, 6))
-        style.configure("Action.TButton", padding=(14, 8), font=("TkDefaultFont", 10, "bold"))
-        style.map(
-            "Action.TButton",
-            background=[("active", "#1d4ed8"), ("!disabled", "#2563EB")],
-            foreground=[("!disabled", "white")]
-        )
+        style.configure(".",
+                       background=C_WIN, foreground=C_TEXT,
+                       fieldbackground=C_SURFACE2, bordercolor=C_BORDER,
+                       darkcolor=C_BORDER, lightcolor=C_BORDER,
+                       troughcolor=C_SURFACE2, relief="flat", borderwidth=1)
+
+        style.configure("TFrame", background=C_WIN)
+        style.configure("TLabel", background=C_WIN, foreground=C_TEXT)
+
+        style.configure("TButton",
+                       background=C_SURFACE2, foreground=C_TEXT_DIM,
+                       borderwidth=1, relief="flat", padding=(8, 4))
+        style.map("TButton",
+                  background=[("active", "#2D333B"), ("pressed", C_BORDER)],
+                  foreground=[("active", C_TEXT)])
+
+        style.configure("Action.TButton",
+                       background=C_ACCENT, foreground="#ffffff",
+                       borderwidth=0, relief="flat",
+                       padding=(16, 8), font=F_UI_BOLD)
+        style.map("Action.TButton",
+                  background=[("active", C_ACCENT_LT), ("disabled", C_BORDER)],
+                  foreground=[("disabled", C_TEXT_MUTED)])
+
+        style.configure("TEntry",
+                       fieldbackground=C_SURFACE2, foreground=C_TEXT,
+                       bordercolor=C_BORDER, insertcolor=C_TEXT,
+                       padding=(6, 4), relief="flat")
+        style.map("TEntry", bordercolor=[("focus", C_ACCENT)])
+
+        style.configure("TCombobox",
+                       fieldbackground=C_SURFACE2, foreground=C_TEXT,
+                       background=C_SURFACE2, bordercolor=C_BORDER,
+                       arrowcolor=C_TEXT_DIM, relief="flat", padding=(4, 4))
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", C_SURFACE2)],
+                  foreground=[("readonly", C_TEXT)])
+
+        style.configure("TScrollbar",
+                       background=C_SURFACE2, troughcolor=C_WIN,
+                       bordercolor=C_WIN, arrowcolor=C_TEXT_MUTED,
+                       width=8, arrowsize=8)
+        style.map("TScrollbar", background=[("active", C_BORDER)])
+
+        style.configure("Card.TLabelframe",
+                       background=C_SURFACE, bordercolor=C_BORDER,
+                       borderwidth=1, relief="solid")
+        style.configure("Card.TLabelframe.Label",
+                       background=C_SURFACE, foreground=C_TEXT_DIM,
+                       font=F_UI_BOLD)
 
     def create_widgets(self):
-        # ── Row 1: device selector + connection controls ──
-        toolbar = ttk.Frame(self.root, style="Toolbar.TFrame")
-        toolbar.pack(fill=tk.X)
+        # ── Header ─────────────────────────────────────────────────────────────
+        header = tk.Frame(self.root, bg=C_HEADER_BG, height=80)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
 
-        ttk.Label(toolbar, text="设备:").pack(side=tk.LEFT)
-        self.device_combo = ttk.Combobox(
-            toolbar,
-            textvariable=self.selected_device,
-            state="readonly",
-            width=28
-        )
-        self.device_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
+        icon_canvas = tk.Canvas(header, width=80, height=80,
+                               bg=C_HEADER_BG, highlightthickness=0)
+        icon_canvas.pack(side=tk.LEFT, padx=(20, 0))
+        self.root.after(20, lambda: self._draw_android(icon_canvas))
+
+        title_frame = tk.Frame(header, bg=C_HEADER_BG)
+        title_frame.pack(side=tk.LEFT, fill=tk.Y, pady=18, padx=(8, 0))
+        tk.Label(title_frame, text="ADB Device Tools",
+                font=F_TITLE, bg=C_HEADER_BG, fg=C_TEXT).pack(anchor=tk.W)
+        tk.Label(title_frame, text="在线设备管理与文件操作",
+                font=("Segoe UI", 9), bg=C_HEADER_BG, fg=C_TEXT_DIM).pack(anchor=tk.W, pady=(3, 0))
+
+        tk.Frame(self.root, bg=C_ACCENT, height=1).pack(fill=tk.X)
+
+        # ── Toolbar ────────────────────────────────────────────────────────────
+        tb = tk.Frame(self.root, bg=C_SURFACE, padx=14, pady=8)
+        tb.pack(fill=tk.X)
+
+        tk.Label(tb, text="设备", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM).pack(side=tk.LEFT)
+        self.device_combo = ttk.Combobox(tb, textvariable=self.selected_device,
+                                        state="readonly", width=26)
+        self.device_combo.pack(side=tk.LEFT, padx=(6, 8))
         self.device_combo.bind("<<ComboboxSelected>>", self.on_device_selected)
 
-        ttk.Button(toolbar, text="刷新", command=self.refresh_data).pack(side=tk.LEFT, padx=(0, 4))
-        self.restart_btn = ttk.Button(toolbar, text="重启 ADB", command=self.restart_adb)
-        self.restart_btn.pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Button(tb, text="刷新", command=self.refresh_data).pack(side=tk.LEFT, padx=(0, 4))
+        self.restart_btn = ttk.Button(tb, text="重启 ADB", command=self.restart_adb)
+        self.restart_btn.pack(side=tk.LEFT, padx=(0, 14))
 
-        # IP connection inline in the same toolbar row
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, pady=4, padx=(0, 8))
-        ttk.Label(toolbar, text="IP:").pack(side=tk.LEFT)
-        ttk.Entry(toolbar, textvariable=self.network_address, width=18).pack(
-            side=tk.LEFT, padx=(4, 6)
-        )
-        self.connect_btn = ttk.Button(
-            toolbar, text="连接", command=self.start_connect_thread
-        )
+        tk.Frame(tb, bg=C_BORDER, width=1, height=22).pack(side=tk.LEFT, pady=1, padx=(0, 12))
+
+        tk.Label(tb, text="IP", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM).pack(side=tk.LEFT)
+        ttk.Entry(tb, textvariable=self.network_address, width=18).pack(side=tk.LEFT, padx=(6, 6))
+        self.connect_btn = ttk.Button(tb, text="连接", command=self.start_connect_thread)
         self.connect_btn.pack(side=tk.LEFT)
 
-        # ── Row 2: nav tabs ──
-        nav_frame = tk.Frame(self.root, bg=COLOR_NAV_IDLE_BG, pady=0)
-        nav_frame.pack(fill=tk.X, padx=10, pady=(6, 0))
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X)
 
-        nav_items = [
-            ("install", "安装 APK"),
+        # ── Nav tabs ───────────────────────────────────────────────────────────
+        nav = tk.Frame(self.root, bg=C_WIN)
+        nav.pack(fill=tk.X, padx=14)
+
+        for key, label in [
+            ("install",   "安装 APK/XAPK"),
             ("uninstall", "卸载应用"),
-            ("push", "推送文件"),
-            ("pull", "拉取文件"),
-            ("terminal", "终端"),
-            ("config", "配置"),
-        ]
-        for feature_name, label in nav_items:
-            btn = NavButton(
-                nav_frame,
-                text=label,
-                command=lambda name=feature_name: self.show_feature(name),
-                bg=COLOR_NAV_IDLE_BG
-            )
-            btn.pack(side=tk.LEFT, padx=(0, 2))
-            self.feature_buttons[feature_name] = btn
+            ("export",    "导出应用"),
+            ("push",      "推送文件"),
+            ("pull",      "拉取文件"),
+            ("terminal",  "ADB 终端"),
+            ("config",    "配置"),
+        ]:
+            btn = TabButton(nav, text=label, command=lambda k=key: self.show_feature(k))
+            btn.pack(side=tk.LEFT)
+            self.feature_buttons[key] = btn
 
-        # ── Row 3: feature panels (fixed height container) ──
-        self.feature_host = tk.Frame(self.root, height=200)
-        self.feature_host.pack(fill=tk.X, padx=10, pady=(0, 4))
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X)
+
+        # ── Feature host ───────────────────────────────────────────────────────
+        self.feature_host = tk.Frame(self.root, bg=C_WIN, height=200)
+        self.feature_host.pack(fill=tk.X, padx=14, pady=(8, 4))
         self.feature_host.pack_propagate(False)
 
         self.create_install_panel()
         self.create_uninstall_panel()
+        self.create_export_panel()
         self.create_push_panel()
         self.create_pull_panel()
         self.create_terminal_panel()
         self.create_config_panel()
 
-        # ── Row 4: log area ──
-        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=(8, 4))
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        # ── Log area ───────────────────────────────────────────────────────────
+        log_outer = tk.Frame(self.root, bg=C_WIN, padx=14, pady=2)
+        log_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
 
-        log_toolbar = ttk.Frame(log_frame)
-        log_toolbar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(log_toolbar, text="ADB 命令和操作结果").pack(side=tk.LEFT)
-        ttk.Button(log_toolbar, text="清空", command=self.clear_log).pack(side=tk.RIGHT)
+        log_hdr = tk.Frame(log_outer, bg=C_WIN, pady=4)
+        log_hdr.pack(fill=tk.X)
+        tk.Label(log_hdr, text="运行日志",
+                font=F_UI_BOLD, bg=C_WIN, fg=C_TEXT_DIM).pack(side=tk.LEFT)
+        ttk.Button(log_hdr, text="清空", command=self.clear_log).pack(side=tk.RIGHT)
+
+        log_border = tk.Frame(log_outer, bg=C_BORDER, padx=1, pady=1)
+        log_border.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
+            log_border,
             state="disabled",
-            font=("Consolas", 9),
+            font=F_MONO,
             wrap=tk.WORD,
-            bg=COLOR_LOG_BG,
-            fg=COLOR_LOG_FG,
-            insertbackground=COLOR_LOG_FG,
-            relief=tk.FLAT,
-            borderwidth=0,
+            bg=C_LOG_BG, fg=C_LOG_FG,
+            insertbackground=C_LOG_FG,
+            relief=tk.FLAT, borderwidth=0,
             selectbackground="#264F78",
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.tag_configure("time", foreground=COLOR_LOG_TIME)
-        self.log_text.tag_configure("cmd", foreground=COLOR_LOG_CMD)
-        self.log_text.tag_configure("ok", foreground=COLOR_LOG_OK)
-        self.log_text.tag_configure("err", foreground=COLOR_LOG_ERR)
+        self.log_text.tag_configure("time", foreground=C_LOG_TIME)
+        self.log_text.tag_configure("cmd",  foreground=C_LOG_CMD)
+        self.log_text.tag_configure("ok",   foreground=C_LOG_OK)
+        self.log_text.tag_configure("err",  foreground=C_LOG_ERR)
+
+    def _draw_android(self, canvas):
+        """Draw Android robot head icon in the header."""
+        cx, cy = 40, 50
+        rx, ry = 21, 16
+
+        # Atmospheric glow behind dome
+        canvas.create_arc(cx - rx - 6, cy - ry - 6, cx + rx + 6, cy + ry + 6,
+                         start=0, extent=180, style=tk.CHORD,
+                         fill="#0b1e36", outline="")
+
+        # Head dome (upper half of ellipse)
+        canvas.create_arc(cx - rx, cy - ry, cx + rx, cy + ry,
+                         start=0, extent=180, style=tk.CHORD,
+                         fill=C_ACCENT, outline="")
+
+        # Eyes (punched out with header bg color)
+        canvas.create_oval(cx - 13, cy - 9, cx - 5, cy - 1,
+                          fill=C_HEADER_BG, outline="")
+        canvas.create_oval(cx + 5, cy - 9, cx + 13, cy - 1,
+                          fill=C_HEADER_BG, outline="")
+
+        # Left antenna: base on dome top → tip upper-left
+        ax1, ay1 = cx - 13, cy - ry + 3
+        ax2, ay2 = cx - 21, cy - ry - 14
+        canvas.create_line(ax1, ay1, ax2, ay2,
+                          fill=C_ACCENT, width=2, capstyle=tk.ROUND)
+        canvas.create_oval(ax2 - 4, ay2 - 4, ax2 + 4, ay2 + 4,
+                          fill=C_ACCENT, outline="")
+
+        # Right antenna
+        bx1, by1 = cx + 13, cy - ry + 3
+        bx2, by2 = cx + 21, cy - ry - 14
+        canvas.create_line(bx1, by1, bx2, by2,
+                          fill=C_ACCENT, width=2, capstyle=tk.ROUND)
+        canvas.create_oval(bx2 - 4, by2 - 4, bx2 + 4, by2 + 4,
+                          fill=C_ACCENT, outline="")
+
+    def _card(self, parent):
+        """Return an inner frame styled as a dark card."""
+        outer = tk.Frame(parent, bg=C_BORDER, padx=1, pady=1)
+        inner = tk.Frame(outer, bg=C_SURFACE, padx=14, pady=12)
+        inner.pack(fill=tk.BOTH, expand=True)
+        return outer, inner
 
     def create_connection_controls(self, parent):
-        # No longer used — connection controls are inline in the toolbar.
         pass
 
     def create_install_panel(self):
-        panel = ttk.LabelFrame(self.feature_host, text="安装 APK", padding=10)
-        row = ttk.Frame(panel)
-        row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(row, text="APK 文件:", width=10).pack(side=tk.LEFT)
+        outer, panel = self._card(self.feature_host)
+        row = tk.Frame(panel, bg=C_SURFACE)
+        row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(row, text="APK/XAPK", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
         self.apk_combo = ttk.Combobox(row, textvariable=self.selected_apk, state="readonly")
-        self.apk_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.apk_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
         self.install_btn = ttk.Button(
-            panel,
-            text="安装到当前设备",
+            panel, text="安装到当前设备",
             command=self.start_install_thread,
             style="Action.TButton"
         )
         self.install_btn.pack(fill=tk.X)
-        self.feature_panels["install"] = panel
+        self.feature_panels["install"] = outer
 
     def create_uninstall_panel(self):
-        panel = ttk.LabelFrame(self.feature_host, text="卸载应用", padding=10)
-        row = ttk.Frame(panel)
-        row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(row, text="应用包名:", width=10).pack(side=tk.LEFT)
+        outer, panel = self._card(self.feature_host)
+        row = tk.Frame(panel, bg=C_SURFACE)
+        row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(row, text="应用包名", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
         self.uninstall_package_combo = ttk.Combobox(
-            row,
-            textvariable=self.selected_uninstall_package,
-            state="readonly"
-        )
-        self.uninstall_package_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            row, textvariable=self.selected_uninstall_package, state="readonly")
+        self.uninstall_package_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
         self.uninstall_btn = ttk.Button(
-            panel,
-            text="从当前设备卸载",
+            panel, text="从当前设备卸载",
             command=self.start_uninstall_thread,
             style="Action.TButton"
         )
         self.uninstall_btn.pack(fill=tk.X)
-        self.feature_panels["uninstall"] = panel
+        self.feature_panels["uninstall"] = outer
+
+    def create_export_panel(self):
+        outer, panel = self._card(self.feature_host)
+
+        package_row = tk.Frame(panel, bg=C_SURFACE)
+        package_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(package_row, text="应用包名", font=F_UI, bg=C_SURFACE,
+                 fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
+        self.export_package_combo = ttk.Combobox(
+            package_row,
+            textvariable=self.selected_export_package,
+            state="readonly"
+        )
+        self.export_package_combo.pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0)
+        )
+
+        target_row = tk.Frame(panel, bg=C_SURFACE)
+        target_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(target_row, text="目标文件夹", font=F_UI, bg=C_SURFACE,
+                 fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
+        ttk.Entry(
+            target_row,
+            textvariable=self.export_target_dir,
+            state="readonly"
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 6))
+        ttk.Button(
+            target_row,
+            text="选择文件夹",
+            command=self.select_export_directory
+        ).pack(side=tk.LEFT)
+
+        self.export_btn = ttk.Button(
+            panel,
+            text="导出到目标文件夹",
+            command=self.start_export_thread,
+            style="Action.TButton"
+        )
+        self.export_btn.pack(fill=tk.X)
+        self.feature_panels["export"] = outer
 
     def create_push_panel(self):
-        panel = ttk.LabelFrame(self.feature_host, text="推送文件到手机", padding=10)
+        outer, panel = self._card(self.feature_host)
 
-        local_row = ttk.Frame(panel)
+        local_row = tk.Frame(panel, bg=C_SURFACE)
         local_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(local_row, text="本地文件:", width=10).pack(side=tk.LEFT)
+        tk.Label(local_row, text="本地文件", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
         ttk.Entry(local_row, textvariable=self.push_local_path).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-        ttk.Button(local_row, text="浏览", command=self.select_local_file).pack(
-            side=tk.LEFT, padx=(6, 0)
-        )
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 6))
+        ttk.Button(local_row, text="浏览", command=self.select_local_file).pack(side=tk.LEFT)
 
-        remote_row = ttk.Frame(panel)
-        remote_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(remote_row, text="手机路径:", width=10).pack(side=tk.LEFT)
+        remote_row = tk.Frame(panel, bg=C_SURFACE)
+        remote_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(remote_row, text="手机路径", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
         ttk.Entry(remote_row, textvariable=self.push_remote_path).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
 
-        ttk.Button(
-            panel,
-            text="推送到当前设备",
-            command=self.start_push_thread,
-            style="Action.TButton"
-        ).pack(fill=tk.X)
-        self.feature_panels["push"] = panel
+        ttk.Button(panel, text="推送到当前设备",
+                  command=self.start_push_thread,
+                  style="Action.TButton").pack(fill=tk.X)
+        self.feature_panels["push"] = outer
 
     def create_pull_panel(self):
-        panel = ttk.LabelFrame(self.feature_host, text="从手机拉取文件", padding=10)
-        row = ttk.Frame(panel)
+        outer, panel = self._card(self.feature_host)
+        row = tk.Frame(panel, bg=C_SURFACE)
         row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(row, text="手机文件:", width=10).pack(side=tk.LEFT)
+        tk.Label(row, text="手机文件", font=F_UI, bg=C_SURFACE, fg=C_TEXT_DIM, width=8).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.pull_remote_path).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-        ttk.Label(panel, text="文件将保存至本机 ReadByPhone 文件夹。", foreground="#6B7280").pack(
-            anchor=tk.W, pady=(0, 8)
-        )
-        ttk.Button(
-            panel,
-            text="拉取到电脑",
-            command=self.start_pull_thread,
-            style="Action.TButton"
-        ).pack(fill=tk.X)
-        self.feature_panels["pull"] = panel
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        tk.Label(panel, text="文件将保存至本机 ReadByPhone 目录",
+                font=("Segoe UI", 8), bg=C_SURFACE, fg=C_TEXT_MUTED).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Button(panel, text="拉取到电脑",
+                  command=self.start_pull_thread,
+                  style="Action.TButton").pack(fill=tk.X)
+        self.feature_panels["pull"] = outer
 
     def create_terminal_panel(self):
-        # Common ADB commands: (display label, command args template)
-        # {serial} is replaced at runtime; {args} is left for user to fill
         ADB_QUICK_CMDS = [
-            ("查看设备列表",          "devices"),
+            ("查看设备列表",       "devices"),
             ("---", None),
-            ("Shell 交互",            "shell"),
-            ("查看 logcat",           "logcat -d"),
-            ("清空 logcat",           "shell logcat -c"),
+            ("Shell 交互",         "shell"),
+            ("查看 logcat",        "logcat -d"),
+            ("清空 logcat",        "shell logcat -c"),
             ("---", None),
-            ("列出所有应用",          "shell pm list packages"),
-            ("列出第三方应用",        "shell pm list packages -3"),
-            ("列出系统应用",          "shell pm list packages -s"),
+            ("列出所有应用",       "shell pm list packages"),
+            ("列出第三方应用",     "shell pm list packages -3"),
+            ("列出系统应用",       "shell pm list packages -s"),
             ("---", None),
-            ("查看屏幕分辨率",        "shell wm size"),
-            ("查看屏幕密度",          "shell wm density"),
-            ("截图到 /sdcard/",       "shell screencap /sdcard/screen.png"),
-            ("拉取截图",              "pull /sdcard/screen.png"),
+            ("查看屏幕分辨率",     "shell wm size"),
+            ("查看屏幕密度",       "shell wm density"),
+            ("截图到 /sdcard/",    "shell screencap /sdcard/screen.png"),
+            ("拉取截图",           "pull /sdcard/screen.png"),
             ("---", None),
-            ("查看 CPU 信息",         "shell cat /proc/cpuinfo"),
-            ("查看内存信息",          "shell cat /proc/meminfo"),
-            ("查看电池状态",          "shell dumpsys battery"),
-            ("查看网络信息",          "shell ifconfig"),
+            ("查看 CPU 信息",      "shell cat /proc/cpuinfo"),
+            ("查看内存信息",       "shell cat /proc/meminfo"),
+            ("查看电池状态",       "shell dumpsys battery"),
+            ("查看网络信息",       "shell ifconfig"),
             ("---", None),
-            ("重启设备",              "reboot"),
-            ("重启到 Recovery",       "reboot recovery"),
-            ("重启到 Bootloader",     "reboot bootloader"),
+            ("重启设备",           "reboot"),
+            ("重启到 Recovery",    "reboot recovery"),
+            ("重启到 Bootloader",  "reboot bootloader"),
             ("---", None),
-            ("开启无线调试 5555",     "tcpip 5555"),
-            ("关闭无线调试",          "usb"),
+            ("开启无线调试 5555",  "tcpip 5555"),
+            ("关闭无线调试",       "usb"),
         ]
 
-        panel = ttk.LabelFrame(self.feature_host, text="ADB 终端", padding=10)
+        outer, panel = self._card(self.feature_host)
+        panel.config(padx=0, pady=0)
 
-        # Left: quick command list
-        left = ttk.Frame(panel, width=200)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        left = tk.Frame(panel, bg=C_SURFACE, width=190)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(14, 0), pady=12)
         left.pack_propagate(False)
 
-        ttk.Label(left, text="常用命令", foreground="#6B7280").pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(left, text="常用命令", font=("Segoe UI", 8),
+                bg=C_SURFACE, fg=C_TEXT_MUTED).pack(anchor=tk.W, pady=(0, 4))
 
-        cmd_frame = ttk.Frame(left)
+        cmd_frame = tk.Frame(left, bg=C_SURFACE)
         cmd_frame.pack(fill=tk.BOTH, expand=True)
         sb = ttk.Scrollbar(cmd_frame, orient=tk.VERTICAL)
         self.quick_cmd_listbox = tk.Listbox(
-            cmd_frame,
-            yscrollcommand=sb.set,
-            font=("Consolas", 9),
-            bg="#F9FAFB",
-            relief=tk.FLAT,
-            borderwidth=1,
+            cmd_frame, yscrollcommand=sb.set,
+            font=F_MONO,
+            bg=C_SURFACE2, fg=C_TEXT_DIM,
+            selectbackground=C_ACCENT, selectforeground="#ffffff",
+            relief=tk.FLAT, borderwidth=0,
             highlightthickness=1,
-            highlightcolor="#D1D5DB",
-            highlightbackground="#D1D5DB",
+            highlightcolor=C_BORDER, highlightbackground=C_BORDER,
             activestyle="none",
         )
         sb.config(command=self.quick_cmd_listbox.yview)
@@ -410,7 +620,8 @@ class AdbInstallerApp:
         for label, args in ADB_QUICK_CMDS:
             if args is None:
                 self.quick_cmd_listbox.insert(tk.END, "")
-                self.quick_cmd_listbox.itemconfig(tk.END, fg="#D1D5DB", selectbackground="#F9FAFB", selectforeground="#D1D5DB")
+                self.quick_cmd_listbox.itemconfig(tk.END,
+                    fg=C_BORDER, selectbackground=C_SURFACE2, selectforeground=C_BORDER)
             else:
                 idx = self.quick_cmd_listbox.size()
                 self.quick_cmd_listbox.insert(tk.END, "  " + label)
@@ -418,36 +629,38 @@ class AdbInstallerApp:
 
         self.quick_cmd_listbox.bind("<<ListboxSelect>>", self._on_quick_cmd_select)
 
-        # Right: input + output hint
-        right = ttk.Frame(panel)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Divider
+        tk.Frame(panel, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
 
-        ttk.Label(right, text="命令（adb 后的部分，自动附加 -s <设备>）", foreground="#6B7280").pack(anchor=tk.W, pady=(0, 4))
+        right = tk.Frame(panel, bg=C_SURFACE)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 14), pady=12)
 
-        input_row = ttk.Frame(right)
+        tk.Label(right, text="命令（adb 后的部分，自动附加 -s <设备>）",
+                font=("Segoe UI", 8), bg=C_SURFACE, fg=C_TEXT_MUTED).pack(anchor=tk.W, pady=(0, 6))
+
+        input_row = tk.Frame(right, bg=C_SURFACE)
         input_row.pack(fill=tk.X)
 
         self.terminal_cmd_var = tk.StringVar()
-        self.terminal_entry = ttk.Entry(input_row, textvariable=self.terminal_cmd_var, font=("Consolas", 10))
-        self.terminal_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.terminal_entry = ttk.Entry(input_row, textvariable=self.terminal_cmd_var,
+                                       font=F_MONO)
+        self.terminal_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.terminal_entry.bind("<Return>", lambda e: self.run_terminal_command())
 
-        ttk.Button(
-            input_row, text="执行",
-            style="Action.TButton",
-            command=self.run_terminal_command
-        ).pack(side=tk.LEFT)
+        ttk.Button(input_row, text="执行",
+                  style="Action.TButton",
+                  command=self.run_terminal_command).pack(side=tk.LEFT)
 
-        ttk.Label(right, text="结果输出在下方运行日志中", foreground="#9CA3AF").pack(anchor=tk.W, pady=(6, 0))
+        tk.Label(right, text="结果输出在下方运行日志中",
+                font=("Segoe UI", 8), bg=C_SURFACE, fg=C_TEXT_MUTED).pack(anchor=tk.W, pady=(8, 0))
 
-        self.feature_panels["terminal"] = panel
+        self.feature_panels["terminal"] = outer
 
     def _on_quick_cmd_select(self, event=None):
         sel = self.quick_cmd_listbox.curselection()
         if not sel:
             return
-        idx = sel[0]
-        args = self._quick_cmd_map.get(idx)
+        args = self._quick_cmd_map.get(sel[0])
         if args:
             self.terminal_cmd_var.set(args)
             self.terminal_entry.focus_set()
@@ -457,8 +670,6 @@ class AdbInstallerApp:
         raw = self.terminal_cmd_var.get().strip()
         if not raw:
             return
-
-        # Split args; prepend -s <serial> when a device is selected and command is not 'devices'
         import shlex
         try:
             args = shlex.split(raw)
@@ -476,9 +687,7 @@ class AdbInstallerApp:
             self.log("执行命令: " + " ".join(cmd), "cmd")
             try:
                 process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=self.create_startupinfo()
                 )
                 while True:
@@ -504,47 +713,40 @@ class AdbInstallerApp:
         thread.start()
 
     def create_config_panel(self):
-        panel = ttk.LabelFrame(self.feature_host, text="配置", padding=10)
+        outer, panel = self._card(self.feature_host)
+        panel.config(padx=0, pady=0)
 
-        # Two-column layout
-        left = ttk.LabelFrame(panel, text="卸载包名（精确匹配）", padding=8)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-
-        right = ttk.LabelFrame(panel, text="包名前缀（前缀筛选）", padding=8)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
+        left = tk.Frame(panel, bg=C_SURFACE, padx=14, pady=12)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(left, text="卸载包名（精确匹配）",
+                font=F_UI_BOLD, bg=C_SURFACE, fg=C_TEXT_DIM).pack(anchor=tk.W, pady=(0, 6))
         self.pkg_listbox = self._make_config_list(left)
+        self._make_config_controls(left, self.pkg_listbox, UNINSTALL_PACKAGES_FILE, "pkg_entry")
+
+        tk.Frame(panel, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, pady=8)
+
+        right = tk.Frame(panel, bg=C_SURFACE, padx=14, pady=12)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(right, text="包名前缀（前缀筛选）",
+                font=F_UI_BOLD, bg=C_SURFACE, fg=C_TEXT_DIM).pack(anchor=tk.W, pady=(0, 6))
         self.prefix_listbox = self._make_config_list(right)
+        self._make_config_controls(right, self.prefix_listbox, UNINSTALL_PREFIXES_FILE, "prefix_entry")
 
-        self._make_config_controls(
-            left, self.pkg_listbox,
-            UNINSTALL_PACKAGES_FILE,
-            "pkg_entry"
-        )
-        self._make_config_controls(
-            right, self.prefix_listbox,
-            UNINSTALL_PREFIXES_FILE,
-            "prefix_entry"
-        )
-
-        self.feature_panels["config"] = panel
+        self.feature_panels["config"] = outer
 
     def _make_config_list(self, parent):
-        frame = ttk.Frame(parent)
-        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        frame = tk.Frame(parent, bg=C_SURFACE)
+        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
         sb = ttk.Scrollbar(frame, orient=tk.VERTICAL)
         lb = tk.Listbox(
-            frame,
-            yscrollcommand=sb.set,
+            frame, yscrollcommand=sb.set,
             selectmode=tk.EXTENDED,
-            font=("Consolas", 9),
-            height=5,
-            bg="#F9FAFB",
-            relief=tk.FLAT,
-            borderwidth=1,
+            font=F_MONO, height=5,
+            bg=C_SURFACE2, fg=C_TEXT_DIM,
+            selectbackground=C_ACCENT, selectforeground="#ffffff",
+            relief=tk.FLAT, borderwidth=0,
             highlightthickness=1,
-            highlightcolor="#D1D5DB",
-            highlightbackground="#D1D5DB",
+            highlightcolor=C_BORDER, highlightbackground=C_BORDER,
         )
         sb.config(command=lb.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -552,34 +754,27 @@ class AdbInstallerApp:
         return lb
 
     def _make_config_controls(self, parent, listbox, filepath, entry_attr):
-        add_row = ttk.Frame(parent)
+        add_row = tk.Frame(parent, bg=C_SURFACE)
         add_row.pack(fill=tk.X, pady=(0, 4))
         entry = ttk.Entry(add_row)
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         setattr(self, entry_attr, entry)
-        ttk.Button(
-            add_row, text="添加",
-            command=lambda lb=listbox, e=entry: self._config_add(lb, e)
-        ).pack(side=tk.LEFT)
+        ttk.Button(add_row, text="添加",
+                  command=lambda lb=listbox, e=entry: self._config_add(lb, e)).pack(side=tk.LEFT)
 
-        btn_row = ttk.Frame(parent)
+        btn_row = tk.Frame(parent, bg=C_SURFACE)
         btn_row.pack(fill=tk.X)
-        ttk.Button(
-            btn_row, text="删除选中",
-            command=lambda lb=listbox: self._config_delete(lb)
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(
-            btn_row, text="保存",
-            style="Action.TButton",
-            command=lambda lb=listbox, p=filepath: self._config_save(lb, p)
-        ).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="删除选中",
+                  command=lambda lb=listbox: self._config_delete(lb)).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="保存",
+                  style="Action.TButton",
+                  command=lambda lb=listbox, p=filepath: self._config_save(lb, p)).pack(side=tk.LEFT)
 
     def _config_add(self, listbox, entry):
         value = entry.get().strip()
         if not value:
             return
-        existing = list(listbox.get(0, tk.END))
-        if value not in existing:
+        if value not in list(listbox.get(0, tk.END)):
             listbox.insert(tk.END, value)
         entry.delete(0, tk.END)
 
@@ -629,7 +824,6 @@ class AdbInstallerApp:
         if tag:
             self.log_text.insert(tk.END, message + "\n", tag)
         else:
-            # Auto-detect tag from message content
             lower = message.lower()
             if message.startswith("执行命令:"):
                 self.log_text.insert(tk.END, message + "\n", "cmd")
@@ -646,6 +840,11 @@ class AdbInstallerApp:
         filename = filedialog.askopenfilename()
         if filename:
             self.push_local_path.set(filename)
+
+    def select_export_directory(self):
+        directory = filedialog.askdirectory()
+        if directory:
+            self.export_target_dir.set(directory)
 
     def create_startupinfo(self):
         if os.name != "nt":
@@ -692,8 +891,10 @@ class AdbInstallerApp:
         return serial_from_device_label(selection)
 
     def get_apks(self):
-        paths = glob.glob(os.path.join(APK_DIR, "*.apk"))
-        return sorted(os.path.basename(path) for path in paths)
+        paths = []
+        for pattern in ("*.apk", "*.xapk"):
+            paths.extend(glob.glob(os.path.join(APK_DIR, pattern)))
+        return sorted(os.path.basename(path) for path in paths if _is_install_package(path))
 
     def get_installed_packages(self, prefixes):
         device = self.get_selected_serial()
@@ -729,7 +930,129 @@ class AdbInstallerApp:
             self.log("获取设备包列表失败: " + to_text(error))
             return set()
 
+    def _fetch_package_labels(self, device, packages):
+        """Fetch app labels by pulling base.apk and parsing AndroidManifest.xml.
+
+        Pulls each APK to a temp file, extracts the label via binary XML
+        parsing, then cleans up.  Results are cached in self._package_labels.
+        """
+        if not device or not packages:
+            return {}
+
+        # Only fetch labels we don't already have
+        missing = [p for p in packages if p not in self._package_labels]
+        if not missing:
+            return {p: self._package_labels[p] for p in packages
+                    if p in self._package_labels}
+
+        temp_dir = tempfile.gettempdir()
+        new_labels = {}
+
+        for pkg in missing:
+            temp_apk = None
+            try:
+                # Get APK path from device
+                path_output = subprocess.check_output(
+                    ["adb", "-s", device, "shell", "pm", "path", pkg],
+                    startupinfo=self.create_startupinfo(),
+                    timeout=10,
+                )
+                path_line = to_text(path_output).strip()
+                if not path_line.startswith("package:"):
+                    continue
+                apk_path = path_line[len("package:"):].strip()
+                if not apk_path:
+                    continue
+
+                # Pull to temp file
+                temp_apk = os.path.join(temp_dir, "adb_label_{}.apk".format(pkg))
+                subprocess.check_call(
+                    ["adb", "-s", device, "pull", apk_path, temp_apk],
+                    startupinfo=self.create_startupinfo(),
+                    timeout=30,
+                )
+
+                # Extract label
+                label = extract_apk_label(temp_apk)
+                if label:
+                    new_labels[pkg] = label
+                    self._package_labels[pkg] = label
+            except Exception:
+                pass
+            finally:
+                if temp_apk and os.path.isfile(temp_apk):
+                    try:
+                        os.unlink(temp_apk)
+                    except Exception:
+                        pass
+
+        # Merge cached labels with newly fetched ones
+        result = {}
+        for pkg in packages:
+            if pkg in self._package_labels:
+                result[pkg] = self._package_labels[pkg]
+        return result
+
+    def _get_selected_package(self, display_text):
+        """Extract the package name from a combo box display string.
+
+        Display strings are formatted as 'App Label (package.name)' or just
+        'package.name' when no label is available.
+        """
+        if not display_text:
+            return None
+        pkg = self._package_display_map.get(display_text)
+        if pkg:
+            return pkg
+        return display_text.strip()
+
+    def _build_package_display_list(self, packages):
+        """Convert a list of package names to display strings with labels.
+
+        Returns (display_list, display_map) where display_map maps
+        display_string -> package_name.
+        """
+        display_map = {}
+        display_list = []
+        for pkg in packages:
+            label = self._package_labels.get(pkg, "")
+            if label:
+                display = "{} ({})".format(label, pkg)
+            else:
+                display = pkg
+            display_map[display] = pkg
+            display_list.append(display)
+        return display_list, display_map
+
+    def _find_previous_display(self, display_list, display_map, previous_display):
+        """Find a previous selection in the new display list."""
+        if not previous_display:
+            return None
+        previous_pkg = self._get_selected_package(previous_display)
+        if not previous_pkg:
+            return None
+        for display in display_list:
+            if display_map.get(display) == previous_pkg:
+                return display
+        return None
+
+    def get_export_packages(self):
+        device = self.get_selected_serial()
+        if not device:
+            return []
+        try:
+            output = subprocess.check_output(
+                ["adb", "-s", device, "shell", "pm", "list", "packages", "-3"],
+                startupinfo=self.create_startupinfo()
+            )
+            return parse_adb_packages(output)
+        except Exception as error:
+            self.log("获取第三方应用列表失败: " + to_text(error), "err")
+            return []
+
     def refresh_data(self):
+        self._package_labels.clear()
+        self._package_display_map.clear()
         self.log("正在刷新设备和文件列表...")
         previous_device = self.selected_device.get()
         devices = self.get_devices()
@@ -742,7 +1065,6 @@ class AdbInstallerApp:
                     if serial_from_device_label(device) == preferred_serial:
                         preferred_device = device
                         break
-
             if preferred_device:
                 self.selected_device.set(preferred_device)
                 self.preferred_device_serial = None
@@ -760,19 +1082,19 @@ class AdbInstallerApp:
         if apks:
             if self.selected_apk.get() not in apks:
                 self.apk_combo.current(0)
-            self.log("找到 {} 个 APK 文件。".format(len(apks)))
+            self.log("找到 {} 个 APK/XAPK 文件。".format(len(apks)))
         else:
             self.apk_combo.set("")
-            self.log("apk 文件夹中未找到 APK 文件。")
+            self.log("apk 文件夹中未找到 APK/XAPK 文件。")
 
         self.refresh_uninstall_packages()
+        self.refresh_export_packages()
 
     def refresh_uninstall_packages(self):
         configured = load_package_names(UNINSTALL_PACKAGES_FILE)
         prefixes = load_package_names(UNINSTALL_PREFIXES_FILE)
         detected = self.get_installed_packages(prefixes)
 
-        # Filter exact-name entries: only include those actually installed on device
         if configured and self.get_selected_serial():
             installed_set = self.get_all_installed_packages()
             confirmed_configured = [p for p in configured if p in installed_set]
@@ -780,12 +1102,21 @@ class AdbInstallerApp:
             confirmed_configured = []
 
         packages = merge_package_names(confirmed_configured, detected)
-        previous_package = self.selected_uninstall_package.get()
-        self.uninstall_package_combo["values"] = packages
+        previous_display = self.selected_uninstall_package.get()
 
-        if packages:
-            if previous_package in packages:
-                self.selected_uninstall_package.set(previous_package)
+        device = self.get_selected_serial()
+        self._fetch_package_labels(device, packages)
+        display_list, display_map = self._build_package_display_list(packages)
+        self._package_display_map.update(display_map)
+
+        self.uninstall_package_combo["values"] = display_list
+
+        if display_list:
+            found = self._find_previous_display(
+                display_list, display_map, previous_display
+            )
+            if found:
+                self.selected_uninstall_package.set(found)
             else:
                 self.uninstall_package_combo.current(0)
             self.log("卸载列表找到 {} 个已安装包（前缀匹配 {}，精确匹配 {}）。".format(
@@ -798,9 +1129,35 @@ class AdbInstallerApp:
             else:
                 self.log("当前设备未安装任何配置中的包。")
 
+    def refresh_export_packages(self):
+        packages = self.get_export_packages()
+        previous_display = self.selected_export_package.get()
+
+        device = self.get_selected_serial()
+        self._fetch_package_labels(device, packages)
+        display_list, display_map = self._build_package_display_list(packages)
+        self._package_display_map.update(display_map)
+
+        self.export_package_combo["values"] = display_list
+        if display_list:
+            found = self._find_previous_display(
+                display_list, display_map, previous_display
+            )
+            if found:
+                self.selected_export_package.set(found)
+            else:
+                self.export_package_combo.current(0)
+            self.log("找到 {} 个第三方应用可供导出。".format(len(packages)))
+        else:
+            self.export_package_combo.set("")
+            self.log("当前设备未找到可导出的第三方应用。")
+
     def on_device_selected(self, event=None):
+        self._package_labels.clear()
+        self._package_display_map.clear()
         self.log("已切换设备: " + self.selected_device.get())
         self.refresh_uninstall_packages()
+        self.refresh_export_packages()
 
     def start_connect_thread(self):
         try:
@@ -815,8 +1172,7 @@ class AdbInstallerApp:
             try:
                 process = subprocess.Popen(
                     ["adb", "connect", address],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=self.create_startupinfo()
                 )
                 stdout, stderr = process.communicate()
@@ -826,12 +1182,8 @@ class AdbInstallerApp:
                     self.log(output)
                 if error_output:
                     self.log("输出: " + error_output)
-
                 failed_output = (output + " " + error_output).lower()
-                failed = any(
-                    marker in failed_output
-                    for marker in ("failed", "cannot", "unable")
-                )
+                failed = any(m in failed_output for m in ("failed", "cannot", "unable"))
                 if process.returncode == 0 and not failed:
                     self.preferred_device_serial = address
                     self.log("设备连接成功。")
@@ -843,9 +1195,7 @@ class AdbInstallerApp:
             except Exception as error:
                 self.log("连接设备失败: " + to_text(error))
             finally:
-                self.root.after(
-                    0, lambda: self.connect_btn.config(state="normal")
-                )
+                self.root.after(0, lambda: self.connect_btn.config(state="normal"))
 
         self.connect_btn.config(state="disabled")
         thread = threading.Thread(target=run)
@@ -872,7 +1222,8 @@ class AdbInstallerApp:
         thread.daemon = True
         thread.start()
 
-    def run_adb_command(self, args, success_msg="操作成功", success_callback=None):
+    def run_adb_command(self, args, success_msg="操作成功", success_callback=None,
+                        completion_callback=None):
         device = self.get_selected_serial()
         if not device:
             messagebox.showwarning("提示", "请先选择一个设备。")
@@ -884,8 +1235,7 @@ class AdbInstallerApp:
             try:
                 process = subprocess.Popen(
                     ["adb", "-s", device] + args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=self.create_startupinfo()
                 )
                 while True:
@@ -894,11 +1244,9 @@ class AdbInstallerApp:
                         break
                     if output:
                         self.log(to_text(output).strip())
-
                 stderr = process.stderr.read()
                 if stderr:
                     self.log("输出: " + to_text(stderr).strip())
-
                 if process.returncode == 0:
                     self.log(success_msg)
                     if success_callback:
@@ -907,6 +1255,9 @@ class AdbInstallerApp:
                     self.log("操作失败，请检查上方日志。")
             except Exception as error:
                 self.log("执行出错: " + to_text(error))
+            finally:
+                if completion_callback:
+                    self.root.after(0, completion_callback)
 
         thread = threading.Thread(target=run)
         thread.daemon = True
@@ -915,23 +1266,33 @@ class AdbInstallerApp:
     def start_install_thread(self):
         apk = self.selected_apk.get()
         if not apk:
-            messagebox.showwarning("提示", "请先选择一个 APK 文件。")
+            messagebox.showwarning("提示", "请先选择一个 APK/XAPK 文件。")
             return
-        self.run_adb_command(
-            ["install", "-r", os.path.join(APK_DIR, apk)],
-            "安装完成。"
-        )
+        package_path = os.path.join(APK_DIR, apk)
+        if apk.lower().endswith(".xapk"):
+            temp_dir = tempfile.mkdtemp(prefix="adb-xapk-")
+            try:
+                args = build_xapk_install_args(package_path, temp_dir)
+            except ValueError as error:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                self.log(to_text(error), "err")
+                return
+            self.log("XAPK 解包完成，准备安装 {} 个 APK 分包。".format(len(args) - 2))
+            self.run_adb_command(
+                args,
+                "安装完成。",
+                completion_callback=lambda path=temp_dir: shutil.rmtree(path, ignore_errors=True)
+            )
+            return
+        self.run_adb_command(["install", "-r", package_path], "安装完成。")
 
     def start_uninstall_thread(self):
-        package_name = self.selected_uninstall_package.get()
+        display_text = self.selected_uninstall_package.get()
+        package_name = self._get_selected_package(display_text)
         if not package_name:
             messagebox.showwarning("提示", "请先选择一个要卸载的包名。")
             return
-        self.run_adb_command(
-            ["uninstall", package_name],
-            "卸载完成。",
-            self.refresh_data
-        )
+        self.run_adb_command(["uninstall", package_name], "卸载完成。", self.refresh_data)
 
     def start_push_thread(self):
         local = self.push_local_path.get()
@@ -946,7 +1307,6 @@ class AdbInstallerApp:
         if not remote:
             messagebox.showwarning("提示", "请填写手机文件路径。")
             return
-
         if not os.path.exists(PULL_DIR):
             try:
                 os.makedirs(PULL_DIR)
@@ -954,11 +1314,103 @@ class AdbInstallerApp:
             except Exception as error:
                 self.log("创建目录失败: " + to_text(error))
                 return
+        self.run_adb_command(["pull", remote, PULL_DIR],
+                            "文件拉取成功，保存至 " + PULL_DIR)
 
-        self.run_adb_command(
-            ["pull", remote, PULL_DIR],
-            "文件拉取成功，保存至 " + PULL_DIR
+    def start_export_thread(self):
+        device = self.get_selected_serial()
+        if not device:
+            messagebox.showwarning("提示", "请先选择一个设备。")
+            return
+
+        display_text = self.selected_export_package.get().strip()
+        package_name = self._get_selected_package(display_text)
+        if not package_name:
+            messagebox.showwarning("提示", "请先选择一个要导出的应用。")
+            return
+
+        target_dir = self.export_target_dir.get().strip()
+        if not target_dir or not os.path.isdir(target_dir):
+            messagebox.showwarning("提示", "请选择有效的目标文件夹。")
+            return
+
+        self.export_btn.config(state="disabled")
+        thread = threading.Thread(
+            target=self._export_app,
+            args=(device, package_name, target_dir)
         )
+        thread.daemon = True
+        thread.start()
+
+    def _export_app(self, device, package_name, target_dir):
+        def worker_log(message, tag=None):
+            self.root.after(
+                0,
+                lambda message=message, tag=tag: self.log(message, tag)
+            )
+
+        def run_command(command):
+            worker_log("执行命令: " + " ".join(command), "cmd")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                startupinfo=self.create_startupinfo()
+            )
+            stdout, stderr = process.communicate()
+            return process.returncode, to_text(stdout).strip(), to_text(stderr).strip()
+
+        try:
+            query_command = [
+                "adb", "-s", device, "shell", "pm", "path", package_name
+            ]
+            returncode, output, error_output = run_command(query_command)
+            if returncode != 0:
+                worker_log("查询应用 APK 路径失败: " + (error_output or output), "err")
+                return
+
+            apk_paths = parse_adb_apk_paths(output)
+            if not apk_paths:
+                worker_log("导出失败: 未找到 APK 路径。", "err")
+                return
+
+            package_dir = os.path.join(target_dir, package_name)
+            if not os.path.isdir(package_dir):
+                try:
+                    os.makedirs(package_dir)
+                except OSError as error:
+                    worker_log("创建导出目录失败: " + to_text(error), "err")
+                    return
+
+            failed_count = 0
+            for remote_path in apk_paths:
+                local_path = os.path.join(package_dir, os.path.basename(remote_path))
+                pull_command = [
+                    "adb", "-s", device, "pull", remote_path, local_path
+                ]
+                pull_code, pull_output, pull_error = run_command(pull_command)
+                if pull_output:
+                    worker_log(pull_output)
+                if pull_error:
+                    worker_log("输出: " + pull_error, "err" if pull_code else None)
+                if pull_code != 0:
+                    failed_count += 1
+
+            if failed_count:
+                worker_log(
+                    "导出部分失败: 成功 {} 个，失败 {} 个。".format(
+                        len(apk_paths) - failed_count, failed_count
+                    ),
+                    "err"
+                )
+            else:
+                worker_log("导出完成，保存至 " + package_dir, "ok")
+        except OSError:
+            worker_log("导出失败: 未找到 adb 命令，请检查 PATH 配置。", "err")
+        except Exception as error:
+            worker_log("导出失败: " + to_text(error), "err")
+        finally:
+            self.root.after(0, lambda: self.export_btn.config(state="normal"))
 
 
 if __name__ == "__main__":

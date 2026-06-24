@@ -8,7 +8,14 @@ SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from package_config import load_package_names, merge_package_names, parse_adb_package_list
+from package_config import (
+    load_package_names,
+    merge_package_names,
+    parse_adb_apk_paths,
+    parse_adb_package_labels,
+    parse_adb_package_list,
+    parse_adb_packages,
+)
 
 
 class LoadPackageNamesTest(unittest.TestCase):
@@ -64,6 +71,76 @@ class LoadPackageNamesTest(unittest.TestCase):
                 ["com.coolfishgames.game"]
             )
         )
+
+    def test_parses_sorts_and_deduplicates_package_output(self):
+        output = (b"package:com.zeta\n"
+                  b"unexpected output\n"
+                  b" package:com.alpha \n"
+                  b"package:com.zeta\n")
+
+        self.assertEqual(
+            ["com.alpha", "com.zeta"],
+            parse_adb_packages(output)
+        )
+
+    def test_parses_base_and_split_apk_paths_in_device_order(self):
+        output = (b"package:/data/app/com.example/base.apk\n"
+                  b"package:/data/app/com.example/split_config.en.apk\n"
+                  b"package:/data/app/com.example/base.apk\n"
+                  b"noise\n")
+
+        self.assertEqual(
+            [
+                "/data/app/com.example/base.apk",
+                "/data/app/com.example/split_config.en.apk",
+            ],
+            parse_adb_apk_paths(output)
+        )
+
+    def test_apk_path_parser_ignores_non_apk_values(self):
+        self.assertEqual(
+            [],
+            parse_adb_apk_paths(b"package:/data/app/com.example/not-an-apk\n")
+        )
+
+
+class ParseAdbPackageLabelsTest(unittest.TestCase):
+    def test_parses_pipe_separated_package_label_pairs(self):
+        output = (
+            b"com.example.app|Example App\n"
+            b"com.google.chrome|Google Chrome\n"
+        )
+        expected = {
+            "com.example.app": "Example App",
+            "com.google.chrome": "Google Chrome",
+        }
+        self.assertEqual(expected, parse_adb_package_labels(output))
+
+    def test_ignores_lines_without_pipe(self):
+        output = (
+            b"com.example.app|Example App\n"
+            b"garbage line without pipe\n"
+            b"com.test.tool|Test Tool\n"
+        )
+        expected = {
+            "com.example.app": "Example App",
+            "com.test.tool": "Test Tool",
+        }
+        self.assertEqual(expected, parse_adb_package_labels(output))
+
+    def test_skips_empty_labels(self):
+        output = b"com.example.app|\ncom.test.tool|Valid\n"
+        expected = {"com.test.tool": "Valid"}
+        self.assertEqual(expected, parse_adb_package_labels(output))
+
+    def test_handles_unicode_app_names(self):
+        output = (
+            b"com.tencent.mm|\xe5\xbe\xae\xe4\xbf\xa1\n"
+            b"com.example.test|Test\n"
+        )
+        result = parse_adb_package_labels(output)
+        self.assertIn("com.tencent.mm", result)
+        self.assertIn("com.example.test", result)
 
 
 if __name__ == "__main__":
